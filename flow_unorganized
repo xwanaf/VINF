@@ -1,0 +1,179 @@
+import torch.nn as nn
+import torch as t
+import torch
+import torch.nn.init as init
+import toy_data
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import math
+import numpy as np
+import torch as t
+import os
+
+#os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+torch.cuda.set_device(3)
+
+device = t.device('cuda')
+
+D = 2
+K = [2,8,32]
+niters = 10000
+batch_size = 500
+data = 'swissroll'
+sample =  40
+LOW = -10
+HIGH = 10
+beta = 0.01
+alpha = 0.1
+hidden_layer = 100
+lr_decay = 0.999
+
+def plt_samples(samples, npts=100, title="$x ~ p(x)$"):
+    plt.hist2d(samples[:, 0], samples[:, 1], range=[[LOW, HIGH], [LOW, HIGH]], bins=npts, cmap='inferno')
+    plt.gca().invert_yaxis()
+    plt.title(title)
+    
+class p_z0(nn.Module):
+    def __init__(self):
+        super(p_z0, self).__init__()
+    def forward(self,z):
+        z1, z2 = torch.chunk(z, chunks=2, dim=1)
+        norm = torch.sqrt(z1 ** 2 + z2 ** 2)
+
+        exp1 = torch.exp(-0.5 * ((z1 - 2) / 0.8) ** 2)
+        exp2 = torch.exp(-0.5 * ((z1 + 2) / 0.8) ** 2)
+        u = 0.5 * ((norm - 4) / 0.4) ** 2 - torch.log(exp1 + exp2)
+        return torch.exp(-u)
+
+def omega1(z):
+    return t.sin(2 * math.pi * z[:,0]/4)
+
+def omega2(z):
+    return 3 * t.exp(-0.5 * (((z[:,0] - 1)/0.6) ** 2))
+
+def omega3(z):
+    return 3 * t.sigmoid((z[:,0] - 1)/0.3)
+
+class p_z1(nn.Module):
+    def __init__(self):
+        super(p_z1, self).__init__()
+    def forward(self,z):
+        u = 0.5 * (((z[:,1] - omega1(z))/0.4) ** 2)
+        return t.exp(-u)
+    
+class p_z2(nn.Module):
+    def __init__(self):
+        super(p_z2, self).__init__()
+    def forward(self,z):
+        u = - t.log( t.exp(-0.5 * (((z[:,1] - omega1(z))/0.4) ** 2)) + t.exp(-0.5 * (((z[:,1] - omega1(z) + omega3(z))/0.35) ** 2)))
+        return t.exp(-u)
+    
+pz1 = p_z0()
+pz2 = p_z1()
+pz3 = p_z2()
+pz = [pz1,pz2,pz3]
+
+class planar_flow(nn.Module):
+    def __init__(self, features):
+        super(planar_flow, self).__init__()
+        self.features = features
+        self.u = nn.Parameter(t.Tensor(features))
+        self.w = nn.Parameter(t.Tensor(1,features))
+        self.b = nn.Parameter(t.Tensor(1))
+        self.h = nn.Tanh()
+        self.init_parameter()
+    def forward(self, z):
+        linear = self.h(F.linear(z, self.w,self.b)).squeeze()
+        self.det = t.log(t.abs(1 + t.sum(self.w*self.u) * (1 - linear**2)) + 10**(-4))
+        return z + (linear[:,None] * self.u[None,:]).squeeze()
+    
+    def dett(self,z):
+        linear = self.h(F.linear(z, self.w,self.b)).squeeze()
+        return t.log(t.abs(1 + t.sum(self.w*self.u) * (1 - linear**2)) + 10**(-4))
+    
+    def init_parameter(self):
+        init.uniform_(self.w,-0.01,0.01)
+        init.uniform_(self.u,-0.01,0.01)                       
+        init.uniform_(self.b,-0.01,0.01)                       
+                        
+# fig1,axes1=plt.subplots(3,3)
+# fig2,axes2=plt.subplots(3,1)
+                 
+      
+nnet = []
+
+KK = K[2]
+p_z = pz[1]
+
+fig1 = plt.figure()
+
+xaxis = t.linspace(HIGH,LOW,500)
+yaxis = t.linspace(LOW,HIGH,500)
+x1,x2 = t.meshgrid(xaxis,yaxis)
+zaxis = t.cat((x2[:,:,None],x1[:,:,None]),dim = 2).reshape(-1,2)
+z_true = p_z(zaxis).reshape(500,500)
+plt.axis('off')
+plt.imshow(z_true, cmap='inferno')
+plt.savefig('./fig/pz1.png')
+
+for i in range(KK):
+    nnet.append(planar_flow(D))
+flow_net = nn.Sequential(*nnet).to(device)
+
+
+
+
+
+#optimizer = t.optim.Adam(flow_net.parameters(),lr=1e-3)
+# optimizer = t.optim.SGD()([{'params': inference_net_mu.parameters()},
+#                 {'params': inference_net_lnsig.parameters()},
+#                         {'params': flow_net.parameters()},
+#                         {'params': generate_net_mu.parameters()},
+#                         {'params': generate_net_lnsig.parameters()}], lr=0.1, momentum=0.9)
+optimizer = t.optim.RMSprop(flow_net.parameters(), lr=0.01)
+#scheduler = t.optim.lr_scheduler.ExponentialLR(optimizer, lr_decay)
+losss = t.zeros(niters).to(device)
+for itr in range(niters):
+    #scheduler.step()
+    optimizer.zero_grad()
+
+    # load data
+    z_0 = t.randn(sample, 2).to(device)
+
+
+    log_det = 0
+    for net in flow_net:
+        z_k = net(z_0)
+        log_det = log_det + net.dett(z_0)
+        z_0 = z_k
+
+
+#     det = 0
+#     for net in flow_net:
+#         det = det + net.det
+
+    loss = (- t.log(p_z(z_0).squeeze() + 10 ** (-4)) - log_det).mean() 
+    losss[itr] = loss
+    loss.backward()
+    optimizer.step()
+
+    print('Iter{} | Loss {})'.format(itr, loss) )
+
+    if itr  % 100 == 0:
+        sample_size = 100000
+
+        with t.no_grad():        
+            zz = t.randn(sample_size,D).to(device)
+            xx = flow_net(zz)
+
+
+            fig = plt.figure(figsize = (5,5))
+            plt.axis('off')
+
+
+            plt_samples(xx.to('cpu').numpy(), npts=200, title="")
+            
+            plt.savefig('./fig/pz1_k2.png')
+            plt.show()
+            
+
